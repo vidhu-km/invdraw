@@ -5,6 +5,7 @@
   <title>Heel→Toe Export (with same layers)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
+  <!-- leaflet + leaflet-draw -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
 
@@ -12,7 +13,6 @@
     html, body { margin:0; height:100%; font-family:sans-serif; }
     #map { width:100%; height:100%; }
 
-    /* Panel can cover map top-left tools; keep it above map but below draw toolbar */
     #panel {
       position:absolute;
       top:10px; left:10px;
@@ -23,11 +23,11 @@
       border-radius:8px;
       padding:12px;
       font-size:12px;
-      z-index:900; /* was 1000; slightly lower so draw toolbar shows */
+      z-index:900;
       box-shadow: 0 2px 12px rgba(0,0,0,0.12);
     }
 
-    /* Force Leaflet top-left controls (including Leaflet.Draw) above the panel */
+    /* make draw toolbar visible above panel */
     .leaflet-top.leaflet-left,
     .leaflet-control,
     .leaflet-draw {
@@ -95,6 +95,9 @@
       border:1px solid #ddd;
       white-space:nowrap;
     }
+
+    /* optional: fix Leaflet stack with panel */
+    .leaflet-container { font: inherit; }
   </style>
 </head>
 
@@ -137,8 +140,6 @@
   <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
 
   <script>
-    // Ensure draw tool clicks work even with overlays/panes
-    // (Leaflet uses absolute positioned containers; this helps avoid odd stacking issues.)
     const mapEl = document.getElementById("map");
     mapEl.style.position = "relative";
 
@@ -158,7 +159,9 @@
 
     const SECTION_PROP = "Section";
 
+    // Default view (used until we can fit bounds)
     const map = L.map('map', { boxZoom: false }).setView([51.05, -114.07], 10);
+
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
@@ -169,7 +172,6 @@
     const GRID_UNSELECTED_STYLE = { fillOpacity: 0, opacity: 0, color: '#555', weight: 1 };
     const GRID_SELECTED_STYLE   = { fillOpacity: 0.4, opacity: 0.4, color: '#0000ff', weight: 1 };
 
-    // id -> { feature, layer, baseStyle, isGrid, turfFeature }
     const gridIndex = new Map();
 
     function truncate(s, n = 160) {
@@ -227,7 +229,6 @@
       return `<div>${items}${more}</div>`;
     }
 
-    // hover tooltip (like your app)
     let hoverTooltip = null;
     function ensureHoverTooltip() {
       if (hoverTooltip) return;
@@ -251,6 +252,20 @@
     }
     map.on("mouseout", () => hideHoverTooltip());
 
+    // --- NEW: fit view to loaded layers (so opening the link goes to the layers)
+    function fitMapToLayers(layerGroups, padding = [20, 20]) {
+      const bounds = L.latLngBounds([]);
+      for (const lg of layerGroups) {
+        if (!lg) continue;
+        // LayerGroup/FeatureGroup has getBounds()
+        const b = lg.getBounds?.();
+        if (b && b.isValid()) bounds.extend(b);
+      }
+      if (bounds.isValid && bounds.isValid()) {
+        map.fitBounds(bounds, { padding });
+      }
+    }
+
     function loadShapefile(url) {
       const baseStyle = getBaseStyleByUrl(url);
 
@@ -261,13 +276,10 @@
           pane: isGrid ? "selectPane" : undefined,
           style: baseStyle,
           onEachFeature: (feature, layer) => {
-            // Prevent non-grid layers from intercepting draw clicks/gestures
-            layer.options.interactive = true;
-
-            const id = getId(feature);
+            // IMPORTANT: don't let non-grid layers block draw clicks
+            layer.options.interactive = !isGrid;
 
             if (!isGrid) {
-              layer.options.interactive = false; // key fix
               layer.off();
               if (url === "data/Bakken Units.zip" || url === "data/Handsworth Units.zip") {
                 layer.setStyle({ weight: 3, fillOpacity: 0, color: '#555' });
@@ -275,44 +287,48 @@
               return;
             }
 
-            // For grid, you keep hover tooltips
+            const id = getId(feature);
             gridIndex.set(id, { layer, feature, turfFeature: null, baseStyle, isGrid: true });
 
             layer.off();
-
             layer.on("mouseover", () => {
               const html = makeTooltipContent(feature?.properties);
               showHoverTooltipForLayer(layer, html);
             });
-
             layer.on("mouseout", () => hideHoverTooltip());
           }
         });
       });
     }
 
-    // Load layers (same order)
     const otherUrls = shapefileUrls.filter(u => u !== selectableUrl);
     const gridUrls  = shapefileUrls.filter(u => u === selectableUrl);
 
     Promise.all(otherUrls.map(loadShapefile))
       .then((otherLayers) => {
-        L.featureGroup(otherLayers).addTo(map);
-        return Promise.all(gridUrls.map(loadShapefile));
-      })
-      .then((gridLayers) => {
-        L.featureGroup(gridLayers).addTo(map);
+        const otherGroup = L.featureGroup(otherLayers).addTo(map);
 
-        // build turf features for hover/logic consistency (optional, kept from your app)
-        for (const [id, entry] of gridIndex.entries()) {
-          try {
-            entry.turfFeature = turf.feature(entry.feature.geometry, entry.feature.properties);
-          } catch (err) {
-            console.warn("Turf feature build failed for", id, err);
+        // Fit after first batch
+        // (and again after grid if you want)
+        fitMapToLayers([otherGroup]);
+
+        return Promise.all(gridUrls.map(loadShapefile)).then((gridLayers) => {
+          const gridGroup = L.featureGroup(gridLayers).addTo(map);
+
+          // Fit after all layers exist
+          fitMapToLayers([otherGroup, gridGroup]);
+
+          // build turf features for hover/logic consistency
+          for (const [id, entry] of gridIndex.entries()) {
+            try {
+              entry.turfFeature = turf.feature(entry.feature.geometry, entry.feature.properties);
+            } catch (err) {
+              console.warn("Turf feature build failed for", id, err);
+            }
           }
-        }
 
-        hideHoverTooltip();
+          hideHoverTooltip();
+        });
       })
       .catch((err) => {
         console.error("Failed to load one or more shapefiles:", err);
@@ -399,7 +415,6 @@
     map.on(L.Draw.Event.DELETED, () => updateUI());
 
     $exportBtn.addEventListener("click", doExport);
-
     $clearBtn.addEventListener("click", () => {
       drawnItems.clearLayers();
       updateUI();
