@@ -12,6 +12,7 @@
     html, body { margin:0; height:100%; font-family:sans-serif; }
     #map { width:100%; height:100%; }
 
+    /* Panel can cover map top-left tools; keep it above map but below draw toolbar */
     #panel {
       position:absolute;
       top:10px; left:10px;
@@ -22,8 +23,15 @@
       border-radius:8px;
       padding:12px;
       font-size:12px;
-      z-index:1000;
+      z-index:900; /* was 1000; slightly lower so draw toolbar shows */
       box-shadow: 0 2px 12px rgba(0,0,0,0.12);
+    }
+
+    /* Force Leaflet top-left controls (including Leaflet.Draw) above the panel */
+    .leaflet-top.leaflet-left,
+    .leaflet-control,
+    .leaflet-draw {
+      z-index: 2000 !important;
     }
 
     .header {
@@ -129,6 +137,11 @@
   <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
 
   <script>
+    // Ensure draw tool clicks work even with overlays/panes
+    // (Leaflet uses absolute positioned containers; this helps avoid odd stacking issues.)
+    const mapEl = document.getElementById("map");
+    mapEl.style.position = "relative";
+
     // =========================
     // SAME LAYERS AS YOUR APP
     // =========================
@@ -167,7 +180,7 @@
     function getId(feature) {
       if (feature?.id != null) return String(feature.id);
       const p = feature?.properties || {};
-      const candidates = ["Section"];
+      const candidates = [SECTION_PROP, "Section"];
       for (const k of candidates) if (p[k] != null) return String(p[k]);
       return JSON.stringify(p);
     }
@@ -248,9 +261,13 @@
           pane: isGrid ? "selectPane" : undefined,
           style: baseStyle,
           onEachFeature: (feature, layer) => {
+            // Prevent non-grid layers from intercepting draw clicks/gestures
+            layer.options.interactive = true;
+
             const id = getId(feature);
 
             if (!isGrid) {
+              layer.options.interactive = false; // key fix
               layer.off();
               if (url === "data/Bakken Units.zip" || url === "data/Handsworth Units.zip") {
                 layer.setStyle({ weight: 3, fillOpacity: 0, color: '#555' });
@@ -258,6 +275,7 @@
               return;
             }
 
+            // For grid, you keep hover tooltips
             gridIndex.set(id, { layer, feature, turfFeature: null, baseStyle, isGrid: true });
 
             layer.off();
@@ -318,6 +336,7 @@
         marker: false
       }
     });
+
     map.addControl(drawControl);
 
     function getLonLatPairsFromPolyline(layer) {
