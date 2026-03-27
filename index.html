@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Heel→Toe Export (with same layers)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
+
+  <style>
+    html, body { margin:0; height:100%; font-family:sans-serif; }
+    #map { width:100%; height:100%; }
+
+    #panel {
+      position:absolute;
+      top:10px; left:10px;
+      width:380px;
+      max-height:86vh;
+      overflow:auto;
+      background:#fff;
+      border-radius:8px;
+      padding:12px;
+      font-size:12px;
+      z-index:1000;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.12);
+    }
+
+    .header {
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      margin-bottom:10px;
+    }
+    .title { font-weight:800; font-size:13px; }
+
+    .badge {
+      font-size:11px;
+      padding:3px 8px;
+      border-radius:999px;
+      border:1px solid #ccc;
+      white-space:nowrap;
+    }
+
+    .btn {
+      width:100%;
+      padding:9px 10px;
+      margin-bottom:8px;
+      cursor:pointer;
+      border:none;
+      border-radius:6px;
+      background:#eee;
+      color:#000;
+      font-weight:700;
+    }
+    .btn.secondary { background:#ddd; }
+    .btn:disabled { background:#e0e0e0; cursor:not-allowed; }
+
+    .hint {
+      background:#f7f7f7;
+      border:1px solid #e5e5e5;
+      border-radius:6px;
+      padding:8px;
+      margin:8px 0 10px 0;
+      line-height:1.35;
+      color:#333;
+    }
+
+    textarea {
+      width:100%;
+      min-height:180px;
+      resize:vertical;
+      font-size:12px;
+      padding:8px;
+      box-sizing:border-box;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+    }
+
+    .small { font-size:11px; color:#444; line-height:1.35; margin-top:6px; }
+    .key {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+      font-size: 11px;
+      background:#fff;
+      padding:2px 6px;
+      border-radius:6px;
+      border:1px solid #ddd;
+      white-space:nowrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="map"></div>
+
+  <div id="panel">
+    <div class="header">
+      <div class="title">Heel→Toe Well Line Export</div>
+      <div class="badge" id="countBadge">0 wells</div>
+    </div>
+
+    <div class="hint">
+      <div><span class="key">Draw</span>: Use the polyline tool to draw heel→toe lines</div>
+      <div style="margin-top:4px;"><span class="key">Export</span>: each well = one polyline; output is <span class="key">lon,lat</span> lines, wells separated by a blank line</div>
+    </div>
+
+    <button id="exportBtn" class="btn" disabled>Export coords (paste-ready)</button>
+    <button id="clearBtn" class="btn secondary">Clear drawn wells</button>
+
+    <div id="status" class="small">No wells drawn yet.</div>
+
+    <div style="margin-top:10px;">
+      <div style="font-weight:800; font-size:13px; margin-bottom:6px;">Export text</div>
+      <textarea id="exportText" placeholder="Draw polylines to generate output…"></textarea>
+
+      <div style="display:flex; gap:8px; margin-top:8px;">
+        <button id="copyBtn" class="btn secondary" style="margin:0; width:50%;">Copy</button>
+        <button id="dlBtn" class="btn secondary" style="margin:0; width:50%;">Download .txt</button>
+      </div>
+
+      <div class="small">Paste this into your classifier app’s “Pasted coords” box (blank line separates wells).</div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+
+  <script src="https://unpkg.com/shpjs@latest/dist/shp.min.js"></script>
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+
+  <script>
+    // =========================
+    // SAME LAYERS AS YOUR APP
+    // =========================
+    const shapefileUrls = [
+      "data/ooipsectiongrid.zip",
+      "data/Bakken Units.zip",
+      "data/Handsworth Units.zip",
+      "data/lines.zip",
+      "data/sw.zip",
+      "data/T1.zip",
+      "data/T2.zip",
+    ];
+    const selectableUrl = "data/ooipsectiongrid.zip";
+
+    const SECTION_PROP = "Section";
+
+    const map = L.map('map', { boxZoom: false }).setView([51.05, -114.07], 10);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    map.createPane('selectPane');
+    map.getPane('selectPane').style.zIndex = 650;
+
+    const GRID_UNSELECTED_STYLE = { fillOpacity: 0, opacity: 0, color: '#555', weight: 1 };
+    const GRID_SELECTED_STYLE   = { fillOpacity: 0.4, opacity: 0.4, color: '#0000ff', weight: 1 };
+
+    // id -> { feature, layer, baseStyle, isGrid, turfFeature }
+    const gridIndex = new Map();
+
+    function truncate(s, n = 160) {
+      s = (s == null) ? "" : String(s);
+      return s.length > n ? s.slice(0, n) + "…" : s;
+    }
+
+    function getId(feature) {
+      if (feature?.id != null) return String(feature.id);
+      const p = feature?.properties || {};
+      const candidates = ["Section"];
+      for (const k of candidates) if (p[k] != null) return String(p[k]);
+      return JSON.stringify(p);
+    }
+
+    function getBaseStyleByUrl(url) {
+      switch (url) {
+        case "data/Bakken Units.zip":
+        case "data/Handsworth Units.zip":
+          return { weight: 3, color: '#555', fillOpacity: 0, opacity: 1 };
+
+        case "data/lines.zip":
+          return { color: '#808080', weight: 2, opacity: 1, fillOpacity: 0 };
+
+        case "data/sw.zip":
+          return { color: '#1f6bd8', fillColor: '#1f6bd8', fillOpacity: 0.4, opacity: 1 };
+
+        case "data/T1.zip":
+          return { color: '#2ecc71', fillColor: '#2ecc71', fillOpacity: 0.4, opacity: 1 };
+
+        case "data/T2.zip":
+          return { color: '#e74c3c', fillColor: '#e74c3c', fillOpacity: 0.4, opacity: 1 };
+
+        case selectableUrl:
+          return GRID_UNSELECTED_STYLE;
+
+        default:
+          return { weight: 1, fillOpacity: 0.2, opacity: 1, color: '#333' };
+      }
+    }
+
+    function makeTooltipContent(props) {
+      const p = props || {};
+      const entries = Object.entries(p);
+      const max = 8;
+
+      const items = entries.slice(0, max).map(([k, v]) => `
+        <div><b>${k}</b>: ${truncate(v, 120)}</div>
+      `).join("");
+
+      const more = entries.length > max
+        ? `<div><i>+ ${entries.length - max} more…</i></div>`
+        : "";
+
+      return `<div>${items}${more}</div>`;
+    }
+
+    // hover tooltip (like your app)
+    let hoverTooltip = null;
+    function ensureHoverTooltip() {
+      if (hoverTooltip) return;
+      hoverTooltip = L.tooltip({ direction: "auto", opacity: 0.95, sticky: false });
+    }
+    function showHoverTooltipForLayer(layer, html) {
+      ensureHoverTooltip();
+      const center = layer.getBounds?.().getCenter?.();
+      const latlng = center || (layer.getLatLng ? layer.getLatLng() : null);
+
+      hoverTooltip
+        .setContent(html || "")
+        .setLatLng(latlng);
+
+      if (!hoverTooltip._map) hoverTooltip.addTo(map);
+      else hoverTooltip.update();
+    }
+    function hideHoverTooltip() {
+      if (!hoverTooltip) return;
+      hoverTooltip.remove();
+    }
+    map.on("mouseout", () => hideHoverTooltip());
+
+    function loadShapefile(url) {
+      const baseStyle = getBaseStyleByUrl(url);
+
+      return shp(url).then((geojson) => {
+        const isGrid = url === selectableUrl;
+
+        return L.geoJSON(geojson, {
+          pane: isGrid ? "selectPane" : undefined,
+          style: baseStyle,
+          onEachFeature: (feature, layer) => {
+            const id = getId(feature);
+
+            if (!isGrid) {
+              layer.off();
+              if (url === "data/Bakken Units.zip" || url === "data/Handsworth Units.zip") {
+                layer.setStyle({ weight: 3, fillOpacity: 0, color: '#555' });
+              }
+              return;
+            }
+
+            gridIndex.set(id, { layer, feature, turfFeature: null, baseStyle, isGrid: true });
+
+            layer.off();
+
+            layer.on("mouseover", () => {
+              const html = makeTooltipContent(feature?.properties);
+              showHoverTooltipForLayer(layer, html);
+            });
+
+            layer.on("mouseout", () => hideHoverTooltip());
+          }
+        });
+      });
+    }
+
+    // Load layers (same order)
+    const otherUrls = shapefileUrls.filter(u => u !== selectableUrl);
+    const gridUrls  = shapefileUrls.filter(u => u === selectableUrl);
+
+    Promise.all(otherUrls.map(loadShapefile))
+      .then((otherLayers) => {
+        L.featureGroup(otherLayers).addTo(map);
+        return Promise.all(gridUrls.map(loadShapefile));
+      })
+      .then((gridLayers) => {
+        L.featureGroup(gridLayers).addTo(map);
+
+        // build turf features for hover/logic consistency (optional, kept from your app)
+        for (const [id, entry] of gridIndex.entries()) {
+          try {
+            entry.turfFeature = turf.feature(entry.feature.geometry, entry.feature.properties);
+          } catch (err) {
+            console.warn("Turf feature build failed for", id, err);
+          }
+        }
+
+        hideHoverTooltip();
+      })
+      .catch((err) => {
+        console.error("Failed to load one or more shapefiles:", err);
+        alert("Error loading shapefiles – see console for details.");
+      });
+
+    // =========================
+    // DRAW heel→toe lines + export lon/lat
+    // =========================
+    const drawnItems = new L.FeatureGroup();
+    map.addLayer(drawnItems);
+
+    const drawControl = new L.Control.Draw({
+      edit: { featureGroup: drawnItems, remove: true },
+      draw: {
+        polyline: { shapeOptions: { color: "#ff00ff", weight: 3 } },
+        polygon: false,
+        rectangle: false,
+        circle: false,
+        circlemarker: false,
+        marker: false
+      }
+    });
+    map.addControl(drawControl);
+
+    function getLonLatPairsFromPolyline(layer) {
+      const latlngs = layer.getLatLngs();
+      const flat = Array.isArray(latlngs?.[0]) ? latlngs.flat() : latlngs;
+      return flat.map(p => [p.lng, p.lat]); // lon,lat
+    }
+
+    function wellsFromLayers() {
+      const wells = [];
+      drawnItems.eachLayer(layer => {
+        if (layer instanceof L.Polyline && !(layer instanceof L.CircleMarker)) {
+          const pairs = getLonLatPairsFromPolyline(layer);
+          if (pairs.length >= 2) wells.push(pairs);
+        }
+      });
+      return wells;
+    }
+
+    function formatExportText(wellsLonLatPairs) {
+      const blocks = wellsLonLatPairs.map(well =>
+        well.map(([lon, lat]) => `${lon.toFixed(6)},${lat.toFixed(6)}`).join("\n")
+      );
+      return blocks.join("\n\n");
+    }
+
+    const $countBadge = document.getElementById("countBadge");
+    const $exportBtn = document.getElementById("exportBtn");
+    const $clearBtn = document.getElementById("clearBtn");
+    const $status = document.getElementById("status");
+    const $exportText = document.getElementById("exportText");
+    const $copyBtn = document.getElementById("copyBtn");
+    const $dlBtn = document.getElementById("dlBtn");
+
+    function updateUI() {
+      const wells = wellsFromLayers();
+      $countBadge.textContent = `${wells.length} well${wells.length === 1 ? "" : "s"}`;
+      $exportBtn.disabled = wells.length === 0;
+
+      if (wells.length === 0) {
+        $status.textContent = "No wells drawn yet.";
+        $exportText.value = "";
+      } else {
+        $status.textContent = "Wells ready. Click export to generate text.";
+      }
+    }
+
+    function doExport() {
+      const wells = wellsFromLayers();
+      if (wells.length === 0) return;
+      $exportText.value = formatExportText(wells);
+      $status.textContent = `Exported ${wells.length} well${wells.length === 1 ? "" : "s"}.`;
+    }
+
+    map.on(L.Draw.Event.CREATED, (event) => {
+      drawnItems.addLayer(event.layer);
+      updateUI();
+    });
+    map.on(L.Draw.Event.EDITED, () => updateUI());
+    map.on(L.Draw.Event.DELETED, () => updateUI());
+
+    $exportBtn.addEventListener("click", doExport);
+
+    $clearBtn.addEventListener("click", () => {
+      drawnItems.clearLayers();
+      updateUI();
+    });
+
+    $copyBtn.addEventListener("click", async () => {
+      const t = $exportText.value || "";
+      if (!t.trim()) return;
+
+      try {
+        await navigator.clipboard.writeText(t);
+        $status.textContent = "Copied export text to clipboard.";
+      } catch {
+        const ta = document.createElement("textarea");
+        ta.value = t;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        $status.textContent = "Copied (fallback) export text to clipboard.";
+      }
+    });
+
+    $dlBtn.addEventListener("click", () => {
+      const text = $exportText.value || "";
+      if (!text.trim()) return;
+
+      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "custom_wells_coords.txt";
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    updateUI();
+  </script>
+</body>
+</html>
